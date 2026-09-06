@@ -12,9 +12,9 @@ Additional Use Grant: You may make use of the Licensed Work, provided that
                       A "Commercial Hosted Service" is a service offered to
                       third parties on a paid or freemium basis that provides
                       substantially the same functionality as the Licensed
-                      Work (i.e., an AI agent platform, AI agent hosting
-                      service, or AI agent orchestration service offered as
-                      a managed service to external customers).
+                      Work (i.e., an LLM routing, model-gateway, or
+                      inference-brokering service offered as a managed
+                      service to external customers).
 
                       For clarity, the following uses are always permitted:
                       - Internal use by any organization (commercial or not)
