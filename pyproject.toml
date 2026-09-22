@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awrouter"
-version = "0.3.0"
+version = "0.3.1"
 description = "Aither World Router — the stateless LLM routing plane: model resolution, backend discovery + failover, tier maps, context-window fitting, SSE streaming. OpenAI-compatible, standalone, no fleet dependencies."
 readme = "README.md"
 requires-python = ">=3.10"

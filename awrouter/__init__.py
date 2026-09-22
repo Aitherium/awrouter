@@ -48,4 +48,4 @@ __all__ = [
     "stream_completion",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
