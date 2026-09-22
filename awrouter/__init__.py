@@ -11,6 +11,14 @@ scheduler plane (queues, budgets, heartbeat) belongs to whoever consumes this
 package, not to it.
 """
 
+from .failover import (
+    LoadTracker,
+    Reservation,
+    is_retryable,
+    order_candidates,
+    pressure_band,
+    pressure_with_hysteresis,
+)
 from .registry import Backend, Registry
 from .resolver import (
     ModelSpec,
@@ -24,14 +32,20 @@ from .wire import stream_completion
 
 __all__ = [
     "Backend",
+    "LoadTracker",
     "ModelSpec",
     "Registry",
+    "Reservation",
     "Resolution",
     "ResolutionPolicy",
     "Resolver",
     "TierMap",
     "fit_context",
+    "is_retryable",
+    "order_candidates",
+    "pressure_band",
+    "pressure_with_hysteresis",
     "stream_completion",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

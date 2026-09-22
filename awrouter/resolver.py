@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .failover import LoadTracker, Reservation, order_candidates
 from .registry import Backend, Registry
 
 
@@ -61,8 +62,13 @@ class ResolutionPolicy:
 class Resolution:
     model_id: str
     backend: Backend
-    #: The candidate order the winner came from (audit trail).
+    #: The candidate order the winner came from (audit trail). With a load
+    #: tracker this is the FAILOVER LIST: walk it on a retryable status.
     ranked: list[str] = field(default_factory=list)
+    #: Taken against the winner when a LoadTracker was supplied, so the
+    #: dispatch counts immediately. Release it when the request ends; move
+    #: it if failover lands elsewhere.
+    reservation: Optional[Reservation] = None
 
 
 class RefusalError(Exception):
@@ -113,8 +119,18 @@ class Resolver:
         spec: Optional[ModelSpec] = None,
         prompt_chars: int = 0,
         requested_output_tokens: Optional[int] = None,
+        load: Optional[LoadTracker] = None,
+        pinned: Optional[str] = None,
     ) -> Resolution:
-        """Resolve model_id to a live backend, or raise RefusalError."""
+        """Resolve model_id to a live backend, or raise RefusalError.
+
+        With `load`, the capable set is ordered by live load (pending +
+        smoothed GPU pressure + this process's own in-flight reservations),
+        then pressure, then the policy score, then stable id — and the winner
+        is reserved before returning. Without it, the policy score alone
+        orders, which is the original behaviour. `pinned` puts one backend
+        first, but only if it survived the capability gate.
+        """
         spec = spec or ModelSpec(id=model_id)
 
         if tier_map is not None and not tier_map.allows(tier, spec.id):
@@ -140,10 +156,13 @@ class Resolver:
                 )
             capable = thinkers
 
-        # Score all capable candidates, then health-probe the top few in order.
-        ranked = sorted(
+        # Order all capable candidates (load first when a tracker is supplied,
+        # else the policy score), then health-probe the top few in order.
+        ranked = order_candidates(
             capable,
-            key=lambda b: b.score(self.policy.cost_weight, self.policy.latency_weight),
+            load,
+            pinned=pinned,
+            score=lambda b: b.score(self.policy.cost_weight, self.policy.latency_weight),
         )
         probe_limit = max(1, self.policy.failover_probe_limit)
         for backend in ranked[:probe_limit]:
@@ -152,7 +171,13 @@ class Resolver:
                 fit_context(
                     prompt_chars, backend.context_window, requested, self.policy.tokens_per_char
                 )
-                return Resolution(model_id=spec.id, backend=backend, ranked=[b.id for b in ranked])
+                reservation = load.reserve(backend.id) if load is not None else None
+                return Resolution(
+                    model_id=spec.id,
+                    backend=backend,
+                    ranked=[b.id for b in ranked],
+                    reservation=reservation,
+                )
 
         names = ", ".join(b.id for b in ranked[:probe_limit])
         raise RefusalError(f"no live backend among probed candidates: {names}")

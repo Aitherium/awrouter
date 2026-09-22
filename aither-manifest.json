@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "1",
+  "name": "awrouter",
+  "description": "OpenRouter for your own fleet: pick a model backend by cost/latency/ capability, fail over, fit the context window, stream. Standalone, OpenAI-compatible, no Aither-specifics required to be valuable.",
+  "url": "https://aitherium.github.io/awrouter/",
+  "repository": "https://github.com/Aitherium/awrouter",
+  "kind": "runtime",
+  "status": "no-pages",
+  "adopt": "Point it at your backends (vLLM / llama.cpp / any OpenAI-compatible endpoint); ask it which backend should serve model X right now, or to stream a completion with failover and context fitting.",
+  "pairs_with": [
+    "awdk",
+    "awsh",
+    "awnode"
+  ],
+  "includes": [],
+  "metrics": {
+    "files": {
+      "value": 15,
+      "as_of": "2026-09-21T12:58:05-07:00"
+    },
+    "tests": {
+      "value": 2,
+      "as_of": "2026-09-21T12:58:05-07:00"
+    }
+  }
+}
