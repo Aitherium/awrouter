@@ -8,7 +8,7 @@ version = "0.3.1"
 description = "Aither World Router — the stateless LLM routing plane: model resolution, backend discovery + failover, tier maps, context-window fitting, SSE streaming. OpenAI-compatible, standalone, no fleet dependencies."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "BUSL-1.1" }
 
 # The core (registry/resolver/wire) is stdlib-only. FastAPI/uvicorn are needed
 # only for the `serve` subcommand; the package imports them lazily and fails
