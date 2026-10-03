@@ -28,6 +28,12 @@ from .resolver import (
     TierMap,
     fit_context,
 )
+from .routing import (
+    lane_state,
+    parse_fallbacks,
+    parse_standins,
+    route_marker,
+)
 from .wire import stream_completion
 
 __all__ = [
@@ -42,9 +48,13 @@ __all__ = [
     "TierMap",
     "fit_context",
     "is_retryable",
+    "lane_state",
     "order_candidates",
+    "parse_fallbacks",
+    "parse_standins",
     "pressure_band",
     "pressure_with_hysteresis",
+    "route_marker",
     "stream_completion",
 ]
 

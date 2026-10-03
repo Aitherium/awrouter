@@ -242,6 +242,12 @@ class LoadTracker:
         self.release(reservation)
         return self.reserve(backend_id)
 
+    def in_flight(self, backend_id: str) -> int:
+        """Pending + reserved work on a backend — the count a concurrency cap
+        is measured against (pressure is a rank signal, not a slot)."""
+        with self._lock:
+            return self._pending.get(backend_id, 0) + self._reservations.get(backend_id, 0)
+
     # -- the number the order is built on ------------------------------------------
 
     def load(self, backend_id: str) -> int:

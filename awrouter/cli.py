@@ -2,6 +2,12 @@
 
 The `serve` subcommand needs the optional `serve` extra (fastapi + uvicorn);
 everything else is stdlib-only.
+
+`--config FILE` (JSON) replaces the demo inventory with your own:
+``{"backends": [{"id", "base_url", "aliases", "max_concurrent", "health_url",
+...}], "standins": {"model": ["a", "b"]}, "interactive_fallbacks": {"model":
+"fallback"}, "health_ttl_s": 5}``. The CLI also honours the posture env
+(AITHER_MODEL_STANDINS, AITHER_INTERACTIVE_BUSY_FALLBACKS) over the file.
 """
 
 from __future__ import annotations
@@ -9,8 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Optional
+import urllib.request
+from typing import Any, Callable, Optional
 
+from .failover import LoadTracker
 from .registry import Backend, Registry
 from .resolver import (
     ModelSpec,
@@ -20,6 +28,14 @@ from .resolver import (
     TierMap,
     fit_context,
 )
+from .routing import PRIORITIES, normalize_priority, route_marker
+from .wire import stream_completion, unwrap_tool_calls
+
+#: Backend fields a config entry may set (health_url is the CLI's own probe).
+_BACKEND_KEYS = {
+    "id", "base_url", "aliases", "capabilities", "context_window", "max_output_tokens",
+    "cost_per_1k_input", "cost_per_1k_output", "latency_p50_ms", "max_concurrent",
+}
 
 
 def _demo_registry() -> Registry:
@@ -65,9 +81,96 @@ def _demo_registry() -> Registry:
     return registry
 
 
-def _cmd_resolve(args: argparse.Namespace) -> int:
+def _http_probe(url: str, timeout: float = 2.0) -> Callable[[], bool]:
+    """A liveness probe for a config backend: GET url answers 2xx in time."""
+
+    def probe() -> bool:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return 200 <= int(resp.status) < 300
+
+    return probe
+
+
+def load_config(path: str) -> tuple[Registry, dict[str, str]]:
+    """Read a JSON router config: (registry, interactive_fallbacks).
+
+    Unknown backend keys raise (a typo never silently drops a cap); a
+    ``health_url`` becomes the backend's probe, else it is declared up.
+    """
+    with open(path, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    registry = Registry(
+        standins=raw.get("standins") or {},
+        health_ttl_s=float(raw.get("health_ttl_s", 5.0)),
+    )
+    for entry in raw.get("backends") or []:
+        entry = dict(entry)
+        health_url = entry.pop("health_url", None)
+        unknown = set(entry) - _BACKEND_KEYS
+        if unknown:
+            raise ValueError(f"backend {entry.get('id')!r}: unknown keys {sorted(unknown)}")
+        entry["capabilities"] = set(entry.get("capabilities") or ())
+        if health_url:
+            entry["health_check"] = _http_probe(str(health_url))
+        registry.register(Backend(**entry))
+    return registry, dict(raw.get("interactive_fallbacks") or {})
+
+
+def _build_resolver(args: argparse.Namespace) -> Resolver:
+    """The demo inventory, or --config's; the posture env is honoured either way."""
+    fallbacks: dict[str, str] = {}
     registry = _demo_registry()
-    resolver = Resolver(registry, ResolutionPolicy(args.cost_weight, args.latency_weight))
+    if getattr(args, "config", None):
+        registry, fallbacks = load_config(args.config)
+    policy = ResolutionPolicy(
+        cost_weight=getattr(args, "cost_weight", 1.0),
+        latency_weight=getattr(args, "latency_weight", 0.0),
+        interactive_fallbacks=fallbacks,
+    )
+    return Resolver(registry, policy, use_env=True)
+
+
+def effective_priority(asked: Optional[str], ceiling: str) -> str:
+    """The priority a serve request gets: a client may LOWER its own
+    priority, never raise it above the server's ``--max-priority``.
+
+    Priority decides who may take an interactive fallback, so it is set
+    server-side, as the fleet does; a body cannot claim ``user`` on its own.
+    """
+    asked_name = normalize_priority(asked) if asked else ceiling
+    rank = PRIORITIES.index
+    return asked_name if rank(asked_name) >= rank(ceiling) else ceiling
+
+
+def _completion_from_events(events: list[dict[str, Any]], model: str, route: dict) -> dict:
+    """Fold forwarded SSE events into one chat.completion body."""
+    for event in reversed(events):
+        if isinstance(event.get("aither_route"), dict):
+            route = event["aither_route"]
+            break
+    folded = unwrap_tool_calls(iter(events))
+    message: dict[str, Any] = {"role": "assistant", "content": folded["content"]}
+    if folded["tool_calls"]:
+        message["tool_calls"] = [
+            {"id": c["id"], "type": "function",
+             "function": {"name": c["name"], "arguments": c["arguments"]}}
+            for c in folded["tool_calls"]
+        ]
+    return {
+        "id": "chatcmpl-awrouter",
+        "object": "chat.completion",
+        "model": model,
+        "aither_route": route,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": "tool_calls" if folded["tool_calls"] else "stop",
+        }],
+    }
+
+
+def _cmd_resolve(args: argparse.Namespace) -> int:
+    resolver = _build_resolver(args)
     tier_map = TierMap({"free": {"quick-model"}})
     spec = ModelSpec(id=args.model, thinking=args.thinking, requirements=set(args.requires))
     try:
@@ -77,6 +180,7 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
             tier_map=tier_map if args.tier else None,
             spec=spec,
             prompt_chars=args.prompt_chars,
+            priority=args.priority,
         )
     except Exception as exc:
         print(f"refused: {exc}")
@@ -86,6 +190,7 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
         "backend": resolution.backend.id,
         "base_url": resolution.backend.base_url,
         "ranked": resolution.ranked,
+        "aither_route": resolution.route,
     }
     print(json.dumps(result, indent=2) if args.json else result["backend"])
     return 0
@@ -119,29 +224,95 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"serve needs the 'serve' extra: pip install 'awrouter[serve]' ({exc})")
         return 2
 
-    registry = _demo_registry()
-    resolver = Resolver(registry, ResolutionPolicy())
+    from fastapi.responses import (  # type: ignore[import-not-found]
+        JSONResponse,
+        StreamingResponse,
+    )
+    from starlette.concurrency import (
+        run_in_threadpool,  # type: ignore[import-not-found]
+    )
+
+    resolver = _build_resolver(args)
+    registry = resolver.registry
+    #: In-flight per backend for this process. With Backend.max_concurrent it
+    #: is what makes a lane BUSY: a forwarded request holds its slot until done.
+    load = LoadTracker()
     app = FastAPI(title="awrouter", version="0.1.0")
+
+    def refused(status: int, message: str, kind: str, route: dict) -> Any:
+        # Every response carries aither_route, a refusal included.
+        return JSONResponse(
+            status_code=status,
+            content={"error": {"message": message, "type": kind}, "aither_route": route},
+        )
+
+    def release(resolution: Any) -> None:
+        if resolution.reservation is not None:
+            load.release(resolution.reservation)
 
     @app.get("/v1/models")
     def models() -> dict:
         return registry.snapshot()
 
-    @app.post("/v1/chat/completions")
-    async def chat(request: Request) -> dict:
+    async def chat(request: Request) -> Any:
         body = await request.json()
-        model_id = body.get("model", "")
+        model_id = str(body.get("model", ""))
         try:
-            resolution = resolver.resolve(model_id, prompt_chars=len(json.dumps(body)))
+            priority = effective_priority(body.get("priority"), args.max_priority)
+        except ValueError as exc:
+            return refused(400, str(exc), "invalid_request", route_marker(model_id, ""))
+        try:
+            resolution = resolver.resolve(
+                model_id, prompt_chars=len(json.dumps(body)), priority=priority, load=load
+            )
+        except RefusalError as exc:
+            return refused(503, str(exc), "refusal", exc.route)
+        route = resolution.route
+
+        if not args.forward:
+            release(resolution)
+            return {
+                "id": "chatcmpl-resolved",
+                "object": "chat.completion",
+                "model": resolution.model_id,
+                "backend": resolution.backend.id,
+                "aither_route": route,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}}],
+            }
+
+        payload = {k: v for k, v in body.items() if k != "priority"}
+        payload["stream"] = True
+        events = stream_completion(resolution.backend, payload, route=route, timeout=args.timeout)
+        streaming = bool(body.get("stream"))
+        try:
+            if streaming:
+                first = await run_in_threadpool(next, events, None)
+            else:
+                collected = await run_in_threadpool(list, events)
         except Exception as exc:
-            return {"error": {"message": str(exc), "type": "refusal"}}
-        return {
-            "id": "chatcmpl-resolved",
-            "object": "chat.completion",
-            "model": resolution.model_id,
-            "backend": resolution.backend.id,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}}],
-        }
+            release(resolution)
+            return refused(502, f"upstream {resolution.backend.id}: {exc}", "upstream", route)
+        if not streaming:
+            release(resolution)
+            return _completion_from_events(collected, resolution.model_id, route)
+
+        def relay() -> Any:
+            try:
+                if first is not None:
+                    yield f"data: {json.dumps(first)}\n\n"
+                    for event in events:
+                        yield f"data: {json.dumps(event)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                release(resolution)
+
+        return StreamingResponse(relay(), media_type="text/event-stream")
+
+    # PEP 563 makes `Request` the STRING "Request", which FastAPI resolves against
+    # this module's globals, where the lazily imported class is absent: the body
+    # param then reads as a required query field and every POST was a 422.
+    chat.__annotations__["request"] = Request
+    app.post("/v1/chat/completions")(chat)
 
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
@@ -217,7 +388,9 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--prompt-chars", type=int, default=0)
     resolve.add_argument("--cost-weight", type=float, default=1.0)
     resolve.add_argument("--latency-weight", type=float, default=0.0)
+    resolve.add_argument("--priority", choices=["user", "agent", "background"], default=None)
     resolve.add_argument("--json", action="store_true")
+    resolve.add_argument("--config", help="router config JSON (default: the demo inventory)")
     resolve.set_defaults(func=_cmd_resolve)
 
     backends = sub.add_parser("backends", help="show the registry inventory")
@@ -233,6 +406,16 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="serve the OpenAI wire shape (needs serve extra)")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8240)
+    serve.add_argument("--config", help="router config JSON (default: the demo inventory)")
+    serve.add_argument(
+        "--max-priority", choices=list(PRIORITIES), default="agent",
+        help="highest priority a request body may claim (user: a single-user local router)",
+    )
+    serve.add_argument(
+        "--forward", action="store_true",
+        help="proxy to the resolved backend (default: answer with the resolution only)",
+    )
+    serve.add_argument("--timeout", type=float, default=60.0, help="upstream timeout, seconds")
     serve.set_defaults(func=_cmd_serve)
 
     selftest = sub.add_parser("self-test", help="prove the refusals can fire")

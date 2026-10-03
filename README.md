@@ -55,6 +55,7 @@ awrouter resolve big-model --tier free       # refused: not allowed on tier 'fre
 awrouter fit --prompt-chars 50000 --window 8192   # refused: context overflow
 awrouter backends --json                     # the registry inventory
 awrouter serve --port 8240                   # /v1/models + /v1/chat/completions
+awrouter serve --config router.json --forward --max-priority user   # your backends, proxied
 awrouter self-test                           # prove the refusals can fire (exit 1 on any silent pass)
 ```
 
@@ -87,12 +88,47 @@ finally:
 The shape is adapted from NVIDIA Personal AI Router's scheduler and proxy
 (Apache-2.0, https://github.com/NVIDIA/Personal-AI-Router). No code was copied.
 
+## Stand-ins, priority and the route marker (fleet parity)
+
+The same routing semantics the AitherOS fleet scheduler applies, with no
+config meaning "behave exactly as before":
+
+- **Stand-in chains.** `Registry(standins={"gemma4-12b": ["pool", "bonsai"]})`.
+  When nobody serves the requested model the chain is walked: first stand-in
+  with a FREE lane, else the first busy one, a down lane only when all are.
+  A request with `pinned=` never takes a stand-in: it refuses.
+- **Priority.** `resolve(..., priority="user"|"agent"|"background")`, default
+  `agent`. A user request whose lane is busy or down moves to its interactive
+  fallback (`ResolutionPolicy(interactive_fallbacks={...})`) only when that
+  lane is free. Agent, background and pinned work never move.
+- **Posture env is opt-in.** `Resolver(..., use_env=True)` lets
+  `AITHER_MODEL_STANDINS="gemma4-12b=pool|bonsai"` and
+  `AITHER_INTERACTIVE_BUSY_FALLBACKS="pool=bonsai"` win per name. A library
+  Resolver ignores them; the CLI turns it on.
+- **Busy** needs a measure: `Backend(max_concurrent=N)` plus a `LoadTracker`
+  (pending + reservations >= N). Without both a live lane is free. Lane
+  reads reuse a probe younger than `Registry(health_ttl_s=5.0)`.
+- **`aither_route`.** `Resolution.route` is `{requested, served_by,
+  cross_model}`. `stream_completion(backend, payload, route=res.route)` sends
+  `served_by` as the body's `model` and stamps the marker on every chunk; an
+  upstream's own marker (the fleet's) is composed with it — the caller's
+  `requested`, the upstream's `served_by`. A `RefusalError.route` carries
+  `refused: true` and, for a refused substitute, `attempted` + `reason`.
+- **Locally.** `awrouter serve --config router.json --forward` proxies to
+  the resolved backend and holds its slot, so `max_concurrent` makes a lane
+  busy. Priority is capped server-side by `--max-priority` (default
+  `agent`; a body may lower it, never raise it). Every response, a refusal
+  (HTTP 503) included, carries `aither_route`. Config shape: `{"backends":
+  [{"id", "base_url", "aliases", "max_concurrent", "health_url", ...}],
+  "standins": {...}, "interactive_fallbacks": {...}}`.
+
 ## The contract
 
 - **Refuse, never guess.** Unknown model, capability gap, tier block,
   thinking model with no thinking backend, context overflow, all-dead
   backends — each is a `Refusal` with the reason. Nothing is truncated,
-  downgraded, or silently re-routed.
+  downgraded, or silently re-routed: a stand-in or fallback is declared by
+  the operator and disclosed on `aither_route`.
 - **Stateless.** The resolver holds no queue, no budget, no in-flight state.
   Scale it horizontally; the state lives in the caller.
 - **Pluggable seams.** Backend discovery, auth, token counting, and health

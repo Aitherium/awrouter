@@ -7,8 +7,12 @@ is an injected callable so the registry stays a pure data plane.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+#: How long one probe result answers lane-state reads (seconds).
+DEFAULT_HEALTH_TTL_S = 5.0
 
 
 @dataclass
@@ -35,6 +39,11 @@ class Backend:
     #: Optional liveness probe: called with no arguments, returns True if the
     #: backend answers. None means "assume up" (declared, not verified).
     health_check: Optional[Callable[[], bool]] = None
+    #: Concurrent requests this backend serves before it is BUSY (one slot on
+    #: a llama.cpp box is 1). 0 means unknown: the lane is never called busy,
+    #: so stand-in and interactive-fallback choices fall back to liveness.
+    #: Appended LAST: a published dataclass never shifts a positional field.
+    max_concurrent: int = 0
 
     def covers(self, requirement: set[str]) -> bool:
         """True when this backend satisfies every hard requirement."""
@@ -49,13 +58,28 @@ class Backend:
 class Registry:
     """Ordered collection of backends, addressable by id and by alias."""
 
-    def __init__(self, backends: Optional[list[Backend]] = None) -> None:
+    def __init__(
+        self,
+        backends: Optional[list[Backend]] = None,
+        *,
+        standins: Optional[dict[str, list[str]]] = None,
+        health_ttl_s: float = DEFAULT_HEALTH_TTL_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._by_id: dict[str, Backend] = {}
         #: One alias may be served by SEVERAL backends — that is the failover
         #: case (two engines serving one model id), not an error.
         self._by_alias: dict[str, list[Backend]] = {}
+        #: model id -> ordered stand-in chain, walked when nobody serves it.
+        self._standins: dict[str, list[str]] = {}
+        #: backend id -> (probed_at, alive): the last probe, read by lane state.
+        self._health: dict[str, tuple[float, bool]] = {}
+        self.health_ttl_s = health_ttl_s
+        self.clock = clock
         for backend in backends or []:
             self.register(backend)
+        for model_id, chain in (standins or {}).items():
+            self.declare_standins(model_id, chain)
 
     def register(self, backend: Backend) -> None:
         """Add a backend. A duplicate id raises (fail loud)."""
@@ -64,6 +88,21 @@ class Registry:
         self._by_id[backend.id] = backend
         for alias in backend.aliases:
             self._by_alias.setdefault(alias, []).append(backend)
+
+    def declare_standins(self, model_id: str, chain: list[str]) -> None:
+        """Name the models that answer for ``model_id``, in preference order.
+
+        A model never stands in for itself; an empty chain removes the entry.
+        """
+        cleaned = [m for m in (c.strip() for c in chain) if m and m != model_id]
+        if cleaned:
+            self._standins[model_id] = cleaned
+        else:
+            self._standins.pop(model_id, None)
+
+    def standins_for(self, model_id: str) -> list[str]:
+        """The declared stand-in chain for ``model_id`` (empty when none)."""
+        return list(self._standins.get(model_id, []))
 
     def get(self, backend_id: str) -> Optional[Backend]:
         return self._by_id.get(backend_id)
@@ -75,13 +114,33 @@ class Registry:
         return [b for b in self._by_id.values() if model_id in b.aliases]
 
     def alive(self, backend: Backend) -> bool:
-        """The injected probe decides; an absent probe declares up."""
+        """The injected probe decides; an absent probe declares up.
+
+        Always probes, and records the answer for ``last_alive``.
+        """
         if backend.health_check is None:
             return True
         try:
-            return bool(backend.health_check())
+            up = bool(backend.health_check())
         except Exception:
-            return False
+            up = False
+        self._health[backend.id] = (self.clock(), up)
+        return up
+
+    def last_alive(self, backend: Backend) -> bool:
+        """Liveness for a lane-state READ: the last probe while it is younger
+        than ``health_ttl_s``, else one fresh probe.
+
+        Choosing between lanes reads many backends per request; this bounds
+        that to one probe per backend per TTL window instead of one per read
+        (the fleet scheduler reads its cached health map the same way).
+        """
+        if backend.health_check is None:
+            return True
+        seen = self._health.get(backend.id)
+        if seen is not None and self.clock() - seen[0] < self.health_ttl_s:
+            return seen[1]
+        return self.alive(backend)
 
     def snapshot(self) -> dict:
         """Serializable inventory for /backends/snapshot."""

@@ -92,22 +92,69 @@ def unwrap_tool_calls(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
     return {"content": "".join(content_parts), "tool_calls": ordered}
 
 
+def compose_route(ours: dict[str, Any], upstream: Any) -> dict[str, Any]:
+    """Fold an upstream's ``aither_route`` into the one awrouter decided.
+
+    awrouter fronts routers that stamp their own marker (the MicroScheduler
+    adapter: every fleet response carries one). The upstream only ever saw
+    the model awrouter SENT, so its ``requested`` is awrouter's ``served_by``:
+    keep the caller's ``requested`` from ours, take the upstream's
+    ``served_by`` (it knows who really answered), and recompute
+    ``cross_model`` across the whole chain. Any other upstream keys survive.
+    A marker that is not a dict carries nothing to compose: ours stands.
+    """
+    if not isinstance(upstream, dict):
+        return dict(ours)
+    requested = str(ours.get("requested") or upstream.get("requested") or "")
+    served = str(upstream.get("served_by") or ours.get("served_by") or "")
+    merged = dict(upstream)
+    merged.update(
+        {
+            "requested": requested,
+            "served_by": served,
+            "cross_model": bool(requested and served and served != requested),
+        }
+    )
+    return merged
+
+
 def stream_completion(
     backend: Backend,
     payload: dict[str, Any],
     *,
     headers: Optional[dict[str, str]] = None,
     timeout: float = 60.0,
+    route: Optional[dict[str, Any]] = None,
 ) -> Generator[dict[str, Any], None, None]:
     """POST a chat completion to the backend and yield parsed SSE events.
 
     The body is streamed line by line — never buffered — so a long
     generation starts reaching the caller as soon as the first token lands.
+
+    `route` (a Resolution's `route`) does two things. The request body's
+    `model` is set to the route's `served_by`, so a stand-in or fallback the
+    resolver chose is what the backend is actually asked for (behind a
+    shared front door the body's model IS the routing key); the caller's
+    payload is not mutated. And `aither_route` is stamped on every event, as
+    the fleet scheduler does on every chunk; an upstream's own marker is
+    composed with it (`compose_route`), never allowed to hide the
+    substitution awrouter made.
     """
+    if route is not None and route.get("served_by"):
+        payload = {**payload, "model": route["served_by"]}
     body = json.dumps(payload).encode("utf-8")
     merged = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     merged.update(headers or {})
     url = backend.base_url.rstrip("/") + "/v1/chat/completions"
     request = urllib.request.Request(url, data=body, headers=merged, method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        yield from iter_sse(response)
+        if route is None:
+            yield from iter_sse(response)
+            return
+        for event in iter_sse(response):
+            if isinstance(event, dict):
+                upstream = event.get("aither_route")
+                event["aither_route"] = (
+                    dict(route) if upstream is None else compose_route(route, upstream)
+                )
+            yield event
