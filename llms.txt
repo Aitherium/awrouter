@@ -1,0 +1,29 @@
+# awrouter
+
+> OpenRouter for your own fleet: pick a model backend by cost/latency/ capability, fail over, fit the context window, stream. Standalone, OpenAI-compatible, no Aither-specifics required to be valuable.
+
+Every LLM call in the platform routes through MicroScheduler (:8150) -- but the routing logic (backend discovery, failover, tier maps, context fitting, streaming) is buried inside a 19,535-line service with 107 monorepo imports. A stranger cannot run it: it demands the internal CA, services.yaml discovery, secrets at :8111, the fleet's model inventory. The routing plane is valuable standalone and entangled by accident of packaging, not by design.
+
+## Install
+
+```
+pip install awrouter
+```
+
+## Use it in 30 seconds
+
+Point it at your backends (vLLM / llama.cpp / any OpenAI-compatible endpoint); ask it which backend should serve model X right now, or to stream a completion with failover and context fitting.
+
+## Composes with
+
+- [awdk](https://aitherium.github.io/awdk/) — Build AI agent fleets — 3 lines, any backend, local or cloud.
+- [awsh](https://aitherium.github.io/awsh/) — Your terminal answers you -- type a question where a command would go.
+- [awnode](https://aitherium.github.io/awnode/) — A lightweight local gateway — bridges your apps to the AI backends you chose.
+
+## Where it lives
+
+- Repo: https://github.com/Aitherium/awrouter
+
+This repository is mirrored from the AitherOS monorepo by `.github/workflows/sync-awrouter.yml`; hand edits made here are overwritten on the next sync — change the source instead.
+
+Everything Aitherium, in one file for agents: https://aitherium.com/llms.txt
