@@ -23,6 +23,8 @@ Point it at your backends (vLLM / llama.cpp / any OpenAI-compatible endpoint); a
 ## Where it lives
 
 - Repo: https://github.com/Aitherium/awrouter
+- Docs: https://aitherium.github.io/awrouter/
+- Manifest (keys + the one-line adoption story): https://aitherium.github.io/awrouter/aither-manifest.json
 
 This repository is mirrored from the AitherOS monorepo by `.github/workflows/sync-awrouter.yml`; hand edits made here are overwritten on the next sync — change the source instead.
 
